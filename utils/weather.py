@@ -4,14 +4,13 @@ import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
-WEATHER_CACHE_DIR = "model_state/weather_cache"
-os.makedirs(WEATHER_CACHE_DIR, exist_ok=True)
-
+WEATHER_CACHE_DIR   = "model_state/weather_cache"
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-CACHE_TTL_MINUTES = 60
+CACHE_TTL_MINUTES   = 60
+
+os.makedirs(WEATHER_CACHE_DIR, exist_ok=True)
 
 
 def _cache_path(home_id):
@@ -24,7 +23,7 @@ def _load_cache(home_id):
         return None
     with open(path, "r") as f:
         cache = json.load(f)
-    fetched_at = datetime.fromisoformat(cache["fetched_at"])
+    fetched_at  = datetime.fromisoformat(cache["fetched_at"])
     age_minutes = (datetime.now(timezone.utc) - fetched_at).total_seconds() / 60
     if age_minutes > CACHE_TTL_MINUTES:
         return None
@@ -33,13 +32,10 @@ def _load_cache(home_id):
 
 def _save_cache(home_id, data):
     with open(_cache_path(home_id), "w") as f:
-        json.dump(
-            {
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-                "data": data,
-            },
-            f,
-        )
+        json.dump({
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "data":       data,
+        }, f)
 
 
 def get_weather(home_id, lat, lon):
@@ -59,13 +55,13 @@ def get_weather(home_id, lat, lon):
         )
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
-        raw = resp.json()
+        raw  = resp.json()
 
         data = {
-            "cloud_cover_pct": raw["clouds"]["all"],  # 0–100
-            "ambient_temp_c": raw["main"]["temp"],  # celsius
+            "cloud_cover_pct":    raw["clouds"]["all"],
+            "ambient_temp_c":     raw["main"]["temp"],
             "precipitation_prob": 1.0 if raw.get("rain") else 0.0,
-            "weather_condition": raw["weather"][0]["main"],  # e.g. "Clouds"
+            "weather_condition":  raw["weather"][0]["main"],
         }
         _save_cache(home_id, data)
         return data
@@ -73,8 +69,8 @@ def get_weather(home_id, lat, lon):
     except Exception as e:
         print(f"[Weather] API failed for {home_id}: {e}. Using neutral defaults.")
         return {
-            "cloud_cover_pct": 50.0,
-            "ambient_temp_c": 30.0,
+            "cloud_cover_pct":    50.0,
+            "ambient_temp_c":     30.0,
             "precipitation_prob": 0.0,
-            "weather_condition": "Unknown",
+            "weather_condition":  "Unknown",
         }

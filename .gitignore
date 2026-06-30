@@ -1,3 +1,15 @@
+.env
+model_state/
+__pycache__/
+*.pkl
+*.pyc
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

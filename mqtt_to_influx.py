@@ -1,38 +1,46 @@
 import json
+import os
 import paho.mqtt.client as mqtt
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 from physics_and_models import train, predict
 
+load_dotenv()
+
 # ── HiveMQ credentials ────────────────────────────────────────────
-MQTT_BROKER   = "68d36c1becfe4592a74352c9d79b150b.s1.eu.hivemq.cloud"
-MQTT_PORT     = 8883
-MQTT_TOPIC    = "solar/#"
-MQTT_USER     = "cloud_subscriber"
-MQTT_PASSWORD = "rw@LeHx!Bd8Xc3J"
+MQTT_BROKER   = os.getenv("MQTT_BROKER")
+MQTT_PORT     = int(os.getenv("MQTT_PORT", 8883))
+MQTT_TOPIC    = os.getenv("MQTT_TOPIC", "solar/#")
+MQTT_USER     = os.getenv("MQTT_USER")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 
 # ── InfluxDB credentials ──────────────────────────────────────────
-INFLUX_URL    = "https://us-east-1-1.aws.cloud2.influxdata.com"
-INFLUX_TOKEN  = "o_0ud-jO7o-4pmgqigCQci1pCqpjAa5oAjW8k1gW11UnzQqmD6XezEbmnfoMKJaaWHU9Vk0QPiC6DRZAVNk87A=="
-INFLUX_ORG    = "School-project"
-INFLUX_BUCKET = "solar_data"
+INFLUX_URL    = os.getenv("INFLUX_URL")
+INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN")
+INFLUX_ORG    = os.getenv("INFLUX_ORG")
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET")
+
+# ── Home defaults (overridden per-message if ESP32 sends them) ────
+HOME_ID             = os.getenv("HOME_ID",             "home1")
+HOME_LAT            = float(os.getenv("HOME_LAT",      4.8156))
+HOME_LON            = float(os.getenv("HOME_LON",      7.0498))
+BATTERY_TYPE        = os.getenv("BATTERY_TYPE",        "LEAD_ACID")
+NOMINAL_VOLTAGE     = os.getenv("NOMINAL_VOLTAGE",     "12V")
+BATTERY_CAPACITY_WH = int(os.getenv("BATTERY_CAPACITY_WH", 100))
 
 # ── InfluxDB client ───────────────────────────────────────────────
-influx_client = InfluxDBClient(
-    url=INFLUX_URL,
-    token=INFLUX_TOKEN,
-    org=INFLUX_ORG
-)
-write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+write_api     = influx_client.write_api(write_options=SYNCHRONOUS)
 
 
 # ── Write raw sensor reading ──────────────────────────────────────
-def write_sensor_reading(payload, recorded_at):
+def write_sensor_reading(payload: dict, recorded_at: datetime):
     point = (
         Point("sensor_reading")
-        .tag("home_id",       payload.get("home_id", "unknown"))
-        .tag("battery_type",  payload.get("battery_type", "LEAD_ACID"))
+        .tag("home_id",      payload["home_id"])
+        .tag("battery_type", payload["battery_type"])
         .field("solar_voltage",   float(payload["solar_voltage"]))
         .field("solar_current",   float(payload["solar_current"]))
         .field("battery_voltage", float(payload["battery_voltage"]))
@@ -45,7 +53,7 @@ def write_sensor_reading(payload, recorded_at):
 
 
 # ── Write model prediction ────────────────────────────────────────
-def write_model_prediction(result, home_id, recorded_at):
+def write_model_prediction(result: dict, home_id: str, recorded_at: datetime):
     point = (
         Point("model_prediction")
         .tag("home_id", home_id)
@@ -68,11 +76,11 @@ def write_model_prediction(result, home_id, recorded_at):
 # ── MQTT callbacks ────────────────────────────────────────────────
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        print("Connected to HiveMQ")
+        print("[MQTT] Connected to HiveMQ")
         client.subscribe(MQTT_TOPIC)
-        print(f"Subscribed to {MQTT_TOPIC}")
+        print(f"[MQTT] Subscribed to {MQTT_TOPIC}")
     else:
-        print(f"Connection failed with code {rc}")
+        print(f"[MQTT] Connection failed with code {rc}")
 
 
 def on_message(client, userdata, msg):
@@ -80,31 +88,32 @@ def on_message(client, userdata, msg):
         payload = json.loads(msg.payload.decode())
         print(f"\n[IN] {payload}")
 
-        # use ESP32 timestamp if provided, else server time
+        # use ESP32 timestamp if sent, else server time
         if "recorded_at" in payload:
             recorded_at = datetime.fromisoformat(payload["recorded_at"])
         else:
             recorded_at = datetime.now(timezone.utc)
             payload["recorded_at"] = recorded_at.isoformat()
 
-        # set defaults for config fields if not sent by ESP32
-        payload.setdefault("battery_type",        "LEAD_ACID")
-        payload.setdefault("nominal_voltage",      "12V")
-        payload.setdefault("battery_capacity_wh",  100)
-        payload.setdefault("lat",                  4.8156)
-        payload.setdefault("lon",                  7.0498)
+        # fill in config fields from env if ESP32 does not send them
+        payload.setdefault("home_id",             HOME_ID)
+        payload.setdefault("lat",                 HOME_LAT)
+        payload.setdefault("lon",                 HOME_LON)
+        payload.setdefault("battery_type",        BATTERY_TYPE)
+        payload.setdefault("nominal_voltage",     NOMINAL_VOLTAGE)
+        payload.setdefault("battery_capacity_wh", BATTERY_CAPACITY_WH)
 
         # 1. write raw sensor data
         write_sensor_reading(payload, recorded_at)
         print("[DB] sensor_reading written")
 
-        # 2. train on new reading (uses previous state internally)
+        # 2. train on new reading (uses previous saved state internally)
         train(payload)
         print("[ML] trained")
 
         # 3. predict with new reading
         result = predict(payload)
-        print(f"[ML] prediction: {result}")
+        print(f"[ML] {result}")
 
         # 4. write model prediction
         write_model_prediction(result, payload["home_id"], recorded_at)
@@ -121,6 +130,6 @@ client.tls_set()
 client.on_connect = on_connect
 client.on_message = on_message
 
-print("Connecting to HiveMQ...")
+print(f"[MQTT] Connecting to {MQTT_BROKER}...")
 client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
 client.loop_forever()

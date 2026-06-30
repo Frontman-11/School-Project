@@ -1,6 +1,6 @@
 import json
-import pickle
 import os
+import pickle
 from datetime import datetime, timedelta, timezone
 from river import ensemble, preprocessing, compose
 from utils.constants import VOLTAGE_SOC_CURVE, encode_hour, encode_day, encode_month
@@ -148,7 +148,7 @@ def train(data):
 
     physics = compute_physics(data)
 
-    # ground truth for forecasting models = actual V×I arriving now
+    # ground truth for forecasting = actual V×I arriving now
     solar_forecast_model.learn_one(last["forecast_features"], physics["solar_power_physics"])
     load_forecast_model.learn_one(last["forecast_features"],  physics["load_power_physics"])
 
@@ -204,7 +204,7 @@ def predict(data):
         load_next     = physics["load_power_physics"]
         soc_corrected = soc_coulomb
 
-    # sanity checks — outside except, always runs
+    # sanity checks — always runs regardless of exception
     if solar_next <= 0 and physics["solar_power_physics"] > 0:
         solar_next = physics["solar_power_physics"]
     if load_next <= 0 and physics["load_power_physics"] > 0:
@@ -228,14 +228,14 @@ def predict(data):
         "solar_power_now_w": round(physics["solar_power_physics"], 2),
         "load_power_now_w":  round(physics["load_power_physics"], 2),
         "soc_now_percent":   round(soc_corrected * 100, 1),
-        # forecast for next reading (~5 min ahead)
+        # forecast for next 5 minutes
         "solar_next_w":      round(solar_next, 2),
         "load_next_w":       round(load_next, 2),
         "runtime_hours":     round(runtime, 2),
         # weather context
         "cloud_cover_pct":   weather["cloud_cover_pct"],
         "weather_condition": weather["weather_condition"],
-        # debug fields
+        # debug
         "soc_physics_pct":   round(physics["soc_physics"] * 100, 1),
         "soc_coulomb_pct":   round(soc_coulomb * 100, 1),
     }
@@ -243,10 +243,14 @@ def predict(data):
 
 # ── Quick test ────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
     sample = {
-        "home_id":             "home1",
-        "lat":                 4.8156,
-        "lon":                 7.0498,
+        "home_id":             os.getenv("HOME_ID", "home1"),
+        "lat":                 float(os.getenv("HOME_LAT", 4.8156)),
+        "lon":                 float(os.getenv("HOME_LON", 7.0498)),
         "recorded_at":         datetime.now(timezone.utc).isoformat(),
         "solar_voltage":       18.4,
         "solar_current":       2.1,
@@ -254,9 +258,9 @@ if __name__ == "__main__":
         "battery_current":     1.8,
         "load_current":        3.2,
         "temperature":         31.5,
-        "battery_capacity_wh": 100,
-        "battery_type":        "LEAD_ACID",
-        "nominal_voltage":     "12V",
+        "battery_capacity_wh": int(os.getenv("BATTERY_CAPACITY_WH", 100)),
+        "battery_type":        os.getenv("BATTERY_TYPE", "LEAD_ACID"),
+        "nominal_voltage":     os.getenv("NOMINAL_VOLTAGE", "12V"),
     }
     train(sample)
     result = predict(sample)
