@@ -9,6 +9,7 @@ venv/
 dist/
 build/
 .DS_Store
+homes/registry.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

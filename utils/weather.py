@@ -13,11 +13,11 @@ CACHE_TTL_MINUTES   = 60
 os.makedirs(WEATHER_CACHE_DIR, exist_ok=True)
 
 
-def _cache_path(home_id):
+def _cache_path(home_id: str) -> str:
     return f"{WEATHER_CACHE_DIR}/{home_id}_weather.json"
 
 
-def _load_cache(home_id):
+def _load_cache(home_id: str):
     path = _cache_path(home_id)
     if not os.path.exists(path):
         return None
@@ -30,7 +30,7 @@ def _load_cache(home_id):
     return cache["data"]
 
 
-def _save_cache(home_id, data):
+def _save_cache(home_id: str, data: dict):
     with open(_cache_path(home_id), "w") as f:
         json.dump({
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -38,12 +38,7 @@ def _save_cache(home_id, data):
         }, f)
 
 
-def get_weather(home_id, lat, lon):
-    """
-    Returns current weather for the home location.
-    Cached for 60 minutes to avoid burning API quota.
-    Falls back to neutral defaults if API is unreachable.
-    """
+def get_weather(home_id: str, lat: float, lon: float) -> dict:
     cached = _load_cache(home_id)
     if cached:
         return cached
@@ -56,7 +51,6 @@ def get_weather(home_id, lat, lon):
         resp = requests.get(url, timeout=5)
         resp.raise_for_status()
         raw  = resp.json()
-
         data = {
             "cloud_cover_pct":    raw["clouds"]["all"],
             "ambient_temp_c":     raw["main"]["temp"],
@@ -65,7 +59,6 @@ def get_weather(home_id, lat, lon):
         }
         _save_cache(home_id, data)
         return data
-
     except Exception as e:
         print(f"[Weather] API failed for {home_id}: {e}. Using neutral defaults.")
         return {

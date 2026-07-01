@@ -1,9 +1,5 @@
 import math
 
-# ── Voltage → SOC lookup curves ───────────────────────────────────
-# Keyed by battery_type → nominal_voltage
-# All voltages are resting/open-circuit values (no load, no charging)
-
 VOLTAGE_SOC_CURVE = {
     "LEAD_ACID": {
         "12V": [
@@ -48,28 +44,21 @@ VOLTAGE_SOC_CURVE = {
 }
 
 
-# ── Sine/cosine time encoding ─────────────────────────────────────
-# Encodes cyclical time so the model understands that
-# 23:00 and 00:00 are close, and Sunday and Monday are close.
-
-def encode_hour(hour):
-    """hour: 0–23"""
+def encode_hour(hour: int) -> dict:
     return {
         "hour_sin": math.sin(2 * math.pi * hour / 24),
         "hour_cos": math.cos(2 * math.pi * hour / 24),
     }
 
 
-def encode_day(day):
-    """day: 0 (Monday) – 6 (Sunday)"""
+def encode_day(day: int) -> dict:
     return {
         "day_sin": math.sin(2 * math.pi * day / 7),
         "day_cos": math.cos(2 * math.pi * day / 7),
     }
 
 
-def encode_month(month):
-    """month: 1–12"""
+def encode_month(month: int) -> dict:
     return {
         "month_sin": math.sin(2 * math.pi * month / 12),
         "month_cos": math.cos(2 * math.pi * month / 12),

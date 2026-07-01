@@ -1,68 +1,60 @@
+"""
+Scheduler — runs hourly, daily, and monthly forecast jobs
+by calling the FastAPI internal trigger endpoints.
+Reads all registered homes from the registry and runs
+forecasts for each one.
+"""
+
 import os
+import httpx
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
-from influx_reader import get_aggregate, get_temperature_mean, write_forecast
-from forecast_models import run_hourly_forecast, run_daily_forecast, run_monthly_forecast
+from utils.home_registry import list_homes
 
 load_dotenv()
 
-HOME_ID = os.getenv("HOME_ID", "home1")
+API_BASE = f"http://localhost:{os.getenv('API_PORT', 8000)}"
+API_KEY  = os.getenv("API_KEY")
+HEADERS  = {"X-API-Key": API_KEY}
 
 scheduler = BlockingScheduler(timezone="UTC")
 
 
-@scheduler.scheduled_job("interval", hours=1, id="hourly_forecast")
+def _call(endpoint: str, home_id: str):
+    try:
+        resp = httpx.post(f"{API_BASE}{endpoint}/{home_id}", headers=HEADERS, timeout=30)
+        print(f"[Scheduler] {endpoint}/{home_id} → {resp.status_code}: {resp.json()}")
+    except Exception as e:
+        print(f"[Scheduler] {endpoint}/{home_id} failed: {e}")
+
+
+@scheduler.scheduled_job("interval", hours=1, id="hourly_all")
 def hourly_job():
-    print(f"\n[Scheduler] Running hourly forecast for {HOME_ID}")
-    try:
-        agg    = get_aggregate(HOME_ID, "-1h")
-        temp_c = get_temperature_mean(HOME_ID, "-1h")
-        if not agg:
-            print("[Scheduler] Not enough data for hourly forecast. Skipping.")
-            return
-        result = run_hourly_forecast(HOME_ID, agg, temp_c)
-        write_forecast("hourly_forecast", HOME_ID, result, result["forecast_for"])
-        print(f"[Scheduler] Hourly forecast written: {result}")
-    except Exception as e:
-        print(f"[Scheduler] Hourly job error: {e}")
+    homes = list_homes()
+    print(f"\n[Scheduler] Hourly forecast for {len(homes)} home(s): {homes}")
+    for home_id in homes:
+        _call("/internal/run-hourly", home_id)
 
 
-@scheduler.scheduled_job("cron", hour=0, minute=5, id="daily_forecast")
+@scheduler.scheduled_job("cron", hour=0, minute=5, id="daily_all")
 def daily_job():
-    print(f"\n[Scheduler] Running daily forecast for {HOME_ID}")
-    try:
-        agg    = get_aggregate(HOME_ID, "-24h")
-        temp_c = get_temperature_mean(HOME_ID, "-24h")
-        if not agg:
-            print("[Scheduler] Not enough data for daily forecast. Skipping.")
-            return
-        result = run_daily_forecast(HOME_ID, agg, temp_c)
-        write_forecast("daily_forecast", HOME_ID, result, result["forecast_for"])
-        print(f"[Scheduler] Daily forecast written: {result}")
-    except Exception as e:
-        print(f"[Scheduler] Daily job error: {e}")
+    homes = list_homes()
+    print(f"\n[Scheduler] Daily forecast for {len(homes)} home(s): {homes}")
+    for home_id in homes:
+        _call("/internal/run-daily", home_id)
 
 
-@scheduler.scheduled_job("cron", day=1, hour=1, minute=0, id="monthly_forecast")
+@scheduler.scheduled_job("cron", day=1, hour=1, minute=0, id="monthly_all")
 def monthly_job():
-    print(f"\n[Scheduler] Running monthly forecast for {HOME_ID}")
-    try:
-        agg    = get_aggregate(HOME_ID, "-30d")
-        temp_c = get_temperature_mean(HOME_ID, "-30d")
-        if not agg:
-            print("[Scheduler] Not enough data for monthly forecast. Skipping.")
-            return
-        result = run_monthly_forecast(HOME_ID, agg, temp_c)
-        write_forecast("monthly_forecast", HOME_ID, result, result["forecast_for"])
-        print(f"[Scheduler] Monthly forecast written: {result}")
-    except Exception as e:
-        print(f"[Scheduler] Monthly job error: {e}")
+    homes = list_homes()
+    print(f"\n[Scheduler] Monthly forecast for {len(homes)} home(s): {homes}")
+    for home_id in homes:
+        _call("/internal/run-monthly", home_id)
 
 
 if __name__ == "__main__":
-    print(f"[Scheduler] Starting for home: {HOME_ID}")
-    print("[Scheduler] Jobs scheduled:")
-    print("  - Hourly forecast : every hour")
-    print("  - Daily forecast  : every midnight at 00:05 UTC")
-    print("  - Monthly forecast: 1st of each month at 01:00 UTC")
+    print("[Scheduler] Starting")
+    print("  - Hourly  : every hour")
+    print("  - Daily   : midnight 00:05 UTC")
+    print("  - Monthly : 1st of month 01:00 UTC")
     scheduler.start()
