@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: solar-energy-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: API_PORT
+        value: 8000
+    healthCheckPath: /
