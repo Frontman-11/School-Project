@@ -16,6 +16,7 @@ import paho.mqtt.client as mqtt
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 
@@ -205,6 +206,14 @@ app = FastAPI(
     description="ML pipeline for real-time solar monitoring and prediction",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
