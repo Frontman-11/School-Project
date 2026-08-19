@@ -172,3 +172,62 @@ def get_latest_forecast(home_id: str, measurement: str) -> dict | None:
     except Exception as e:
         print(f"[InfluxDB] latest_forecast error: {e}")
         return None
+
+
+# ── Home config persistence ──────────────────────────────────────
+
+def write_home_config(config: dict):
+    point = (
+        Point("home_config")
+        .tag("home_id", config["home_id"])
+        .field("lat", float(config["lat"]))
+        .field("lon", float(config["lon"]))
+        .field("battery_type", config.get("battery_type", "LEAD_ACID"))
+        .field("nominal_voltage", config.get("nominal_voltage", "12V"))
+        .field("battery_capacity_wh", float(config.get("battery_capacity_wh", 100)))
+        .time(datetime.now(timezone.utc), WritePrecision.S)
+    )
+    _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+
+
+def get_home_config(home_id: str) -> dict | None:
+    query = f'''
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: -365d)
+      |> filter(fn: (r) => r._measurement == "home_config")
+      |> filter(fn: (r) => r.home_id == "{home_id}")
+      |> last()
+    '''
+    try:
+        tables = _query_api.query(query)
+        result = {"home_id": home_id}
+        for table in tables:
+            for record in table.records:
+                if record.get_value() is not None:
+                    result[record.get_field()] = record.get_value()
+        return result if len(result) > 1 else None
+    except Exception as e:
+        print(f"[InfluxDB] get_home_config error: {e}")
+        return None
+
+
+def list_home_ids() -> list[str]:
+    query = f'''
+    import "influxdata/influxdb/schema"
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: -365d)
+      |> filter(fn: (r) => r._measurement == "home_config")
+      |> schema.tagValues(tag: "home_id")
+    '''
+    try:
+        tables = _query_api.query(query)
+        ids = []
+        for table in tables:
+            for record in table.records:
+                val = record.get_value()
+                if val and val != "_value":
+                    ids.append(val)
+        return ids
+    except Exception as e:
+        print(f"[InfluxDB] list_home_ids error: {e}")
+        return []

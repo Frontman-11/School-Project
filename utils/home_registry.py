@@ -2,25 +2,11 @@
 Stores and retrieves home configuration.
 Each home registers once with its hardware config.
 Models, state files, and weather cache are all keyed by home_id.
+
+Backend: InfluxDB Cloud (persistent across Render restarts).
 """
 
-import json
-import os
-
-REGISTRY_PATH = "homes/registry.json"
-os.makedirs("homes", exist_ok=True)
-
-
-def _load_registry() -> dict:
-    if not os.path.exists(REGISTRY_PATH):
-        return {}
-    with open(REGISTRY_PATH, "r") as f:
-        return json.load(f)
-
-
-def _save_registry(registry: dict):
-    with open(REGISTRY_PATH, "w") as f:
-        json.dump(registry, f, indent=2)
+from db.influx_client import write_home_config, get_home_config, list_home_ids
 
 
 def register_home(config: dict) -> dict:
@@ -29,21 +15,17 @@ def register_home(config: dict) -> dict:
     config must contain: home_id, lat, lon, battery_type,
                          nominal_voltage, battery_capacity_wh
     """
-    registry = _load_registry()
-    home_id  = config["home_id"]
-    registry[home_id] = config
-    _save_registry(registry)
+    write_home_config(config)
     return config
 
 
 def get_home(home_id: str) -> dict | None:
-    registry = _load_registry()
-    return registry.get(home_id)
+    return get_home_config(home_id)
 
 
 def list_homes() -> list[str]:
-    return list(_load_registry().keys())
+    return list_home_ids()
 
 
 def home_exists(home_id: str) -> bool:
-    return home_id in _load_registry()
+    return get_home(home_id) is not None
