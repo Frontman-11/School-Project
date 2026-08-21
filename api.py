@@ -36,6 +36,7 @@ from db.influx_client import (
     get_aggregate,
     get_temperature_mean,
     get_latest_forecast,
+    get_hourly_history,
 )
 
 load_dotenv()
@@ -346,6 +347,22 @@ def current(home_id: str):
         "sensor": sensor,
         "prediction": prediction,
     }
+
+
+# ── History ───────────────────────────────────────────────────────
+
+
+@app.get("/history/{home_id}", dependencies=[Depends(require_api_key)])
+def history(home_id: str):
+    """
+    Hourly actual vs predicted solar/load power over the last 24 hours.
+    Powers the app's History screen (chart + table).
+    """
+    _check_home(home_id)
+    hours = get_hourly_history(home_id)
+    if not hours:
+        raise HTTPException(status_code=404, detail="No data yet for this home")
+    return {"home_id": home_id, "period": "last_24h", "hours": hours}
 
 
 # ── Averages ──────────────────────────────────────────────────────

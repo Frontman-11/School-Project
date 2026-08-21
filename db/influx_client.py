@@ -67,10 +67,13 @@ def write_forecast(measurement: str, home_id: str, fields: dict, forecast_for: s
 
 # ── Read helpers ──────────────────────────────────────────────────
 
+LATEST_RANGE = os.getenv("LATEST_RANGE", "-24h")
+
+
 def get_latest_prediction(home_id: str) -> dict | None:
     query = f'''
     from(bucket: "{INFLUX_BUCKET}")
-      |> range(start: -1h)
+      |> range(start: {LATEST_RANGE})
       |> filter(fn: (r) => r._measurement == "model_prediction")
       |> filter(fn: (r) => r.home_id == "{home_id}")
       |> last()
@@ -91,7 +94,7 @@ def get_latest_prediction(home_id: str) -> dict | None:
 def get_latest_sensor(home_id: str) -> dict | None:
     query = f'''
     from(bucket: "{INFLUX_BUCKET}")
-      |> range(start: -1h)
+      |> range(start: {LATEST_RANGE})
       |> filter(fn: (r) => r._measurement == "sensor_reading")
       |> filter(fn: (r) => r.home_id == "{home_id}")
       |> last()
@@ -172,6 +175,83 @@ def get_latest_forecast(home_id: str, measurement: str) -> dict | None:
     except Exception as e:
         print(f"[InfluxDB] latest_forecast error: {e}")
         return None
+
+
+def get_hourly_history(home_id: str, hours: int = 24) -> list[dict]:
+    """
+    Hourly averages of actual vs predicted solar/load power over the last N hours.
+    Actual power is derived from raw sensor readings (V x I); predictions come
+    from the model_prediction measurement written on each ingest.
+    Returns rows like: {"time": "14:00", "solar_actual": .., "solar_pred": ..,
+                        "load_actual": .., "load_pred": ..} (null when missing).
+    """
+    range_str = f"-{hours}h"
+
+    def _run(query: str) -> dict[str, float]:
+        try:
+            tables = _query_api.query(query)
+            out: dict[str, float] = {}
+            for table in tables:
+                for record in table.records:
+                    v = record.get_value()
+                    if v is not None:
+                        key = record.get_time().strftime("%H:00")
+                        out[key] = round(float(v), 1)
+            return out
+        except Exception as e:
+            print(f"[InfluxDB] history error: {e}")
+            return {}
+
+    solar_actual = _run(f'''
+        from(bucket: "{INFLUX_BUCKET}")
+          |> range(start: {range_str})
+          |> filter(fn: (r) => r._measurement == "sensor_reading" and r.home_id == "{home_id}")
+          |> filter(fn: (r) => r._field == "solar_voltage" or r._field == "solar_current")
+          |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+          |> map(fn: (r) => ({{ r with value: r.solar_voltage * r.solar_current }}))
+          |> aggregateWindow(every: 1h, fn: mean, column: "value", createEmpty: false)
+    ''')
+
+    load_actual = _run(f'''
+        import "math"
+        from(bucket: "{INFLUX_BUCKET}")
+          |> range(start: {range_str})
+          |> filter(fn: (r) => r._measurement == "sensor_reading" and r.home_id == "{home_id}")
+          |> filter(fn: (r) => r._field == "battery_voltage" or r._field == "load_current")
+          |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+          |> map(fn: (r) => ({{ r with value: math.abs(x: r.battery_voltage * r.load_current) }}))
+          |> aggregateWindow(every: 1h, fn: mean, column: "value", createEmpty: false)
+    ''')
+
+    solar_pred = _run(f'''
+        from(bucket: "{INFLUX_BUCKET}")
+          |> range(start: {range_str})
+          |> filter(fn: (r) => r._measurement == "model_prediction" and r.home_id == "{home_id}")
+          |> filter(fn: (r) => r._field == "solar_power_now_w")
+          |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+    ''')
+
+    load_pred = _run(f'''
+        from(bucket: "{INFLUX_BUCKET}")
+          |> range(start: {range_str})
+          |> filter(fn: (r) => r._measurement == "model_prediction" and r.home_id == "{home_id}")
+          |> filter(fn: (r) => r._field == "load_power_now_w")
+          |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+    ''')
+
+    all_hours = sorted(
+        set(solar_actual) | set(solar_pred) | set(load_actual) | set(load_pred)
+    )
+    return [
+        {
+            "time": h,
+            "solar_actual": solar_actual.get(h),
+            "solar_pred": solar_pred.get(h),
+            "load_actual": load_actual.get(h),
+            "load_pred": load_pred.get(h),
+        }
+        for h in all_hours
+    ]
 
 
 # ── Home config persistence ──────────────────────────────────────
