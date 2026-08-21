@@ -208,8 +208,8 @@ def get_hourly_history(home_id: str, hours: int = 24) -> list[dict]:
           |> filter(fn: (r) => r._measurement == "sensor_reading" and r.home_id == "{home_id}")
           |> filter(fn: (r) => r._field == "solar_voltage" or r._field == "solar_current")
           |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-          |> map(fn: (r) => ({{ r with value: r.solar_voltage * r.solar_current }}))
-          |> aggregateWindow(every: 1h, fn: mean, column: "value", createEmpty: false)
+          |> map(fn: (r) => ({{ r with _value: r.solar_voltage * r.solar_current }}))
+          |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
     ''')
 
     load_actual = _run(f'''
@@ -219,8 +219,8 @@ def get_hourly_history(home_id: str, hours: int = 24) -> list[dict]:
           |> filter(fn: (r) => r._measurement == "sensor_reading" and r.home_id == "{home_id}")
           |> filter(fn: (r) => r._field == "battery_voltage" or r._field == "load_current")
           |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-          |> map(fn: (r) => ({{ r with value: math.abs(x: r.battery_voltage * r.load_current) }}))
-          |> aggregateWindow(every: 1h, fn: mean, column: "value", createEmpty: false)
+          |> map(fn: (r) => ({{ r with _value: math.abs(x: r.battery_voltage * r.load_current) }}))
+          |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
     ''')
 
     solar_pred = _run(f'''
