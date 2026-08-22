@@ -16,6 +16,7 @@ import paho.mqtt.client as mqtt
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 
@@ -35,6 +36,7 @@ from db.influx_client import (
     get_aggregate,
     get_temperature_mean,
     get_latest_forecast,
+    get_hourly_history,
 )
 
 load_dotenv()
@@ -207,6 +209,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ── Auth ──────────────────────────────────────────────────────────
 
@@ -337,6 +347,22 @@ def current(home_id: str):
         "sensor": sensor,
         "prediction": prediction,
     }
+
+
+# ── History ───────────────────────────────────────────────────────
+
+
+@app.get("/history/{home_id}", dependencies=[Depends(require_api_key)])
+def history(home_id: str):
+    """
+    Hourly actual vs predicted solar/load power over the last 24 hours.
+    Powers the app's History screen (chart + table).
+    """
+    _check_home(home_id)
+    hours = get_hourly_history(home_id)
+    if not hours:
+        raise HTTPException(status_code=404, detail="No data yet for this home")
+    return {"home_id": home_id, "period": "last_24h", "hours": hours}
 
 
 # ── Averages ──────────────────────────────────────────────────────
