@@ -1,10 +1,33 @@
 """
-FastAPI — single entry point for the solar pipeline.
-All ML logic, InfluxDB writes, and forecast reads go through here.
-The mobile app backend, MQTT bridge, and scheduler all call this API.
+FastAPI -- single entry point for the solar pipeline.
+
+Flow, in order:
+  1. The ESP32 publishes a sensor reading to HiveMQ. This happens
+     automatically and continuously, on the device's own schedule --
+     nothing here waits for or requires a frontend action.
+  2. The MQTT listener (a background thread started in the lifespan
+     below) receives that message the instant it is published and
+     forwards it to POST /ingest, in this same process, over loopback.
+  3. /ingest auto-provisions a home_config row for the device_id if one
+     does not exist yet (with placeholder defaults), trains the 5-minute
+     models on the previous reading, predicts the next 5 minutes,
+     and writes the raw reading + prediction to InfluxDB.
+  4. The frontend can register/update the real config for that same
+     device_id at any time via POST /homes/register -- it does not need
+     to happen before step 1-3 start working, only before the physics
+     baseline reflects the real battery/location.
+  5. The frontend polls GET /current, /history, /forecast/* to display
+     data. It never needs to "trigger" training or prediction -- that
+     already happened automatically in step 2-3, continuously, driven
+     purely by the device's own publish schedule.
+
+This is a true publish/subscribe pipeline: the MQTT thread is always
+subscribed and always reacting to whatever the device sends, with no
+polling or frontend-initiated step anywhere in the ingest path.
 """
 
 import os
+import json
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -21,26 +44,29 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 
 from utils.home_registry import register_home, get_home, list_homes, home_exists
+from utils.esp_payload import ESPPayload, flatten_esp_payload
+from utils.weather import clear_weather_cache
+from core import model_store
 from core.physics_and_models import train, predict
-from core.forecast_models import (
-    run_hourly_forecast,
-    run_daily_forecast,
-    run_monthly_forecast,
-)
+from core.forecast_models import run_hourly_forecast, run_daily_forecast
+from core.ingest_pipeline import process_reading_for_ml
 from db.influx_client import (
     write_sensor_reading,
     write_model_prediction,
     write_forecast,
     get_latest_prediction,
     get_latest_sensor,
+    get_last_valid_temperature,
     get_aggregate,
     get_temperature_mean,
     get_latest_forecast,
     get_hourly_history,
+    load_pipeline_state,
+    delete_home_data,
 )
 
 load_dotenv()
-logger = logging.getLogger(name=__file__)
+logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("API_KEY", "solar-pipeline-secret-key-2026")
 API_BASE = f"http://localhost:{os.getenv('API_PORT', 8000)}"
@@ -53,15 +79,37 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 8883))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "solar/#")
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
-HOME_ID = os.getenv("HOME_ID", "home1")
-BATTERY_TYPE = os.getenv("BATTERY_TYPE", "LEAD_ACID")
-NOMINAL_VOLTAGE = os.getenv("NOMINAL_VOLTAGE", "12V")
-BATTERY_CAPACITY_WH = int(os.getenv("BATTERY_CAPACITY_WH", 100))
-HOME_LAT = float(os.getenv("HOME_LAT", 4.8156))
-HOME_LON = float(os.getenv("HOME_LON", 7.0498))
+
+# Placeholder config used only when a device sends data before the
+# frontend has registered its real details. `configured: False` lets
+# the frontend detect "this device exists but hasn't been set up yet".
+DEFAULT_HOME_CONFIG = {
+    "lat": 5.5167,
+    "lon": 5.7500,
+    "battery_type": "LEAD_ACID",
+    "nominal_voltage": "12V",
+    "battery_capacity_wh": 100,
+}
+
+
+def _ensure_home(home_id: str) -> dict:
+    config = get_home(home_id)
+    if config:
+        return config
+    config = {
+        "home_id": home_id,
+        **DEFAULT_HOME_CONFIG,
+        "configured": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    register_home(config)
+    print(f"[API] Auto-provisioned new device '{home_id}' with placeholder config")
+    return config
 
 
 # ── MQTT handlers ─────────────────────────────────────────────────
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         print("[MQTT] Connected to HiveMQ")
@@ -72,49 +120,26 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_message(client, userdata, msg):
+    """
+    Forwards the raw ESP JSON straight to /ingest. device_id is inside
+    the payload itself now, so there is no topic-based routing to get
+    wrong -- whatever device_id the message carries is the home_id it
+    is stored and trained under.
+    """
     try:
-        import json
-
-        payload = json.loads(msg.payload.decode())
-        print(f"\n[IN] {payload}")
-        home_id = payload.get("home_id", HOME_ID)
-
-        reading = {
-            "solar_voltage": float(payload["solar_voltage"]),
-            "solar_current": float(payload["solar_current"]),
-            "battery_voltage": float(payload["battery_voltage"]),
-            "battery_current": float(payload["battery_current"]),
-            "load_current": float(payload["load_current"]),
-            "temperature": float(payload["temperature"]),
-            "recorded_at": payload.get("recorded_at"),
-        }
+        payload_dict = json.loads(msg.payload.decode())
+        print(f"\n[MQTT IN] {payload_dict}")
 
         resp = httpx.post(
-            f"{API_BASE}/ingest/{home_id}",
-            json=reading,
+            f"{API_BASE}/ingest",
+            json=payload_dict,
             headers=HEADERS,
-            timeout=10,
+            timeout=15,
         )
-
         if resp.status_code == 200:
-            print(f"[API] {resp.json()}")
-        elif resp.status_code == 404:
-            print(f"[API] Home '{home_id}' not registered — auto-registering...")
-            config = {
-                "home_id": home_id,
-                "lat": payload.get("lat", HOME_LAT),
-                "lon": payload.get("lon", HOME_LON),
-                "battery_type": payload.get("battery_type", BATTERY_TYPE),
-                "nominal_voltage": payload.get("nominal_voltage", NOMINAL_VOLTAGE),
-                "battery_capacity_wh": payload.get(
-                    "battery_capacity_wh", BATTERY_CAPACITY_WH
-                ),
-            }
-            httpx.post(
-                f"{API_BASE}/homes/register", json=config, headers=HEADERS, timeout=10
-            )
+            print(f"[MQTT->API] ok: {resp.json()}")
         else:
-            print(f"[API] Error {resp.status_code}: {resp.text}")
+            print(f"[MQTT->API] error {resp.status_code}: {resp.text}")
 
     except Exception as e:
         print(f"[MQTT ERROR] {e}")
@@ -132,6 +157,8 @@ def start_mqtt():
 
 
 # ── Scheduler jobs ────────────────────────────────────────────────
+
+
 def hourly_job():
     homes = list_homes()
     print(f"\n[Scheduler] Hourly forecast for {homes}")
@@ -164,39 +191,22 @@ def daily_job():
             print(f"[Scheduler] daily error for {home_id}: {e}")
 
 
-def monthly_job():
-    homes = list_homes()
-    print(f"\n[Scheduler] Monthly forecast for {homes}")
-    for home_id in homes:
-        try:
-            agg = get_aggregate(home_id, "-30d")
-            temp_c = get_temperature_mean(home_id, "-30d")
-            if not agg:
-                continue
-            result = run_monthly_forecast(home_id, agg, temp_c)
-            write_forecast("monthly_forecast", home_id, result, result["forecast_for"])
-            print(f"[Scheduler] monthly done for {home_id}: {result}")
-        except Exception as e:
-            print(f"[Scheduler] monthly error for {home_id}: {e}")
+# ── Lifespan -- starts MQTT + scheduler when API boots ────────────
 
 
-# ── Lifespan — starts MQTT + scheduler when API boots ────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # start MQTT in background thread
     mqtt_thread = threading.Thread(target=start_mqtt, daemon=True)
     mqtt_thread.start()
     print("[API] MQTT listener started")
 
-    # start scheduler
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(hourly_job, "interval", hours=1)
     scheduler.add_job(daily_job, "cron", hour=0, minute=5)
-    scheduler.add_job(monthly_job, "cron", day=1, hour=1, minute=0)
     scheduler.start()
-    print("[API] Scheduler started")
+    print("[API] Scheduler started (hourly + daily)")
 
-    yield  # API runs here
+    yield
 
     scheduler.shutdown()
     print("[API] Scheduler stopped")
@@ -205,7 +215,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Solar Energy Management API",
     description="ML pipeline for real-time solar monitoring and prediction",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -222,7 +232,6 @@ app.add_middleware(
 
 
 async def require_api_key(key: str = Security(api_key_header)):
-    logger.info(key)
     if key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
     return key
@@ -240,16 +249,6 @@ class HomeConfig(BaseModel):
     battery_capacity_wh: int = 100
 
 
-class SensorReading(BaseModel):
-    solar_voltage: float
-    solar_current: float
-    battery_voltage: float
-    battery_current: float
-    load_current: float
-    temperature: float
-    recorded_at: Optional[str] = None
-
-
 # ── Health ────────────────────────────────────────────────────────
 
 
@@ -264,12 +263,13 @@ def health():
 @app.post("/homes/register", dependencies=[Depends(require_api_key)])
 def register(config: HomeConfig):
     """
-    Register a new home or update an existing home's config.
-    Must be called once before any data is ingested for a home.
+    Called by the frontend to attach real configuration (location,
+    battery type/voltage/capacity) to a device_id. Can be called before
+    or after the device has started sending data -- if the device
+    already auto-provisioned a placeholder config, this overwrites it
+    and flips configured to True.
     """
-    logger.info(config)
-    logger.info(require_api_key)
-    saved = register_home(config.model_dump())
+    saved = register_home({**config.model_dump(), "configured": True})
     return {"message": "Home registered", "home": saved}
 
 
@@ -286,44 +286,73 @@ def get_home_config(home_id: str):
     return config
 
 
+@app.delete("/homes/{home_id}", dependencies=[Depends(require_api_key)])
+def delete_home(home_id: str):
+    """
+    Wipes every record tagged with this home_id from InfluxDB: sensor
+    readings, predictions, forecasts, config, and all model/pipeline
+    state. This is a development-stage reset tool, not something an
+    end user should have easy access to -- if the same device_id sends
+    new data afterwards, it simply starts over from a clean slate.
+    """
+    _check_home(home_id)
+    delete_home_data(home_id)
+    model_store.clear_home_cache(home_id)
+    clear_weather_cache(home_id)
+    return {"message": f"All data for '{home_id}' has been deleted."}
+
+
 # ── Ingest ────────────────────────────────────────────────────────
 
 
-@app.post("/ingest/{home_id}", dependencies=[Depends(require_api_key)])
-def ingest(home_id: str, reading: SensorReading):
+@app.post("/ingest", dependencies=[Depends(require_api_key)])
+def ingest(payload: ESPPayload):
     """
-    Receives a sensor reading from the ESP32 (via MQTT bridge or direct).
-    Trains the 5-min model, generates a prediction, writes both to InfluxDB.
-    Returns the prediction result.
-    """
-    config = get_home(home_id)
-    if not config:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Home '{home_id}' not registered. Call POST /homes/register first.",
-        )
+    Two independent steps, deliberately not sharing state:
 
-    recorded_at = (
-        datetime.fromisoformat(reading.recorded_at)
-        if reading.recorded_at
-        else datetime.now(timezone.utc)
+    1. ESP -> InfluxDB. Parses the reading and writes it straight to
+       sensor_reading. This always happens, and its success does not
+       depend on anything ML-related below it.
+    2. DB -> ML -> DB. Reads that same reading back out of InfluxDB
+       (not off any in-memory object from step 1), trains, predicts,
+       and writes the prediction back to InfluxDB.
+
+    If step 2 throws for any reason -- a model error, a transient
+    InfluxDB write failure, anything -- the reading from step 1 is
+    already safely persisted. The response still returns 200 with
+    ml_status: "unavailable" rather than losing the sensor data behind
+    a 500, since the device's measurement was never actually at risk.
+    """
+    config = _ensure_home(payload.device_id)
+    fallback_temp = get_last_valid_temperature(payload.device_id)
+    data = flatten_esp_payload(payload, fallback_temp=fallback_temp)
+    recorded_at = datetime.fromisoformat(data["recorded_at"])
+
+    # Step 1 -- ESP -> DB, independent of ML.
+    write_sensor_reading(
+        {**data, "battery_type": config.get("battery_type", "LEAD_ACID")}, recorded_at
     )
 
-    # merge sensor reading with home config into one flat dict
-    data = {
-        **config,
-        **reading.model_dump(exclude={"recorded_at"}),
-        "recorded_at": recorded_at.isoformat(),
+    response = {
+        "home_id": payload.device_id,
+        "configured": config.get("configured", False),
+        "temperature_valid": data["temperature_valid"],
+        "recorded_at": data["recorded_at"],
+        "ml_status": "ok",
     }
 
-    # train → predict → write
-    train(data)
-    result = predict(data)
+    # Step 2 -- DB -> ML -> DB.
+    try:
+        result = process_reading_for_ml(
+            payload.device_id, expected_recorded_at=data["recorded_at"]
+        )
+        response.update(result)
+    except Exception as e:
+        logger.exception(f"[ML] processing failed for '{payload.device_id}'")
+        response["ml_status"] = "unavailable"
+        response["ml_error"] = str(e)
 
-    write_sensor_reading(data, recorded_at)
-    write_model_prediction(result, home_id, recorded_at)
-
-    return result
+    return response
 
 
 # ── Current readings ──────────────────────────────────────────────
@@ -331,10 +360,7 @@ def ingest(home_id: str, reading: SensorReading):
 
 @app.get("/current/{home_id}", dependencies=[Depends(require_api_key)])
 def current(home_id: str):
-    """
-    Returns the latest sensor reading and 5-min prediction from InfluxDB.
-    This is what the app displays as the live dashboard.
-    """
+    """Latest sensor reading + 5-min prediction. Powers the live dashboard."""
     _check_home(home_id)
     prediction = get_latest_prediction(home_id)
     sensor = get_latest_sensor(home_id)
@@ -342,27 +368,24 @@ def current(home_id: str):
     if not prediction and not sensor:
         raise HTTPException(status_code=404, detail="No data yet for this home")
 
-    return {
-        "home_id": home_id,
-        "sensor": sensor,
-        "prediction": prediction,
-    }
+    return {"home_id": home_id, "sensor": sensor, "prediction": prediction}
 
 
 # ── History ───────────────────────────────────────────────────────
 
 
 @app.get("/history/{home_id}", dependencies=[Depends(require_api_key)])
-def history(home_id: str):
+def history(home_id: str, hours: int = 24):
     """
-    Hourly actual vs predicted solar/load power over the last 24 hours.
-    Powers the app's History screen (chart + table).
+    Hourly actual vs predicted solar/load power. Default is the last
+    24 hours; pass ?hours=48 or ?hours=168 to look further back
+    ("as at yesterday", "a few hours ago", etc).
     """
     _check_home(home_id)
-    hours = get_hourly_history(home_id)
-    if not hours:
+    rows = get_hourly_history(home_id, hours=hours)
+    if not rows:
         raise HTTPException(status_code=404, detail="No data yet for this home")
-    return {"home_id": home_id, "period": "last_24h", "hours": hours}
+    return {"home_id": home_id, "period": f"last_{hours}h", "hours": rows}
 
 
 # ── Averages ──────────────────────────────────────────────────────
@@ -370,10 +393,6 @@ def history(home_id: str):
 
 @app.get("/averages/{home_id}", dependencies=[Depends(require_api_key)])
 def averages(home_id: str):
-    """
-    Returns today's average solar and load power.
-    Used by app items 1 (avg power usage today) and 3 (avg solar today).
-    """
     _check_home(home_id)
     agg = get_aggregate(home_id, "-24h")
     if not agg:
@@ -386,10 +405,6 @@ def averages(home_id: str):
 
 @app.get("/forecast/hourly/{home_id}", dependencies=[Depends(require_api_key)])
 def forecast_hourly(home_id: str):
-    """
-    Returns the latest pre-computed 1-hour ahead forecast.
-    Updated every hour by the scheduler.
-    """
     _check_home(home_id)
     result = get_latest_forecast(home_id, "hourly_forecast")
     if not result:
@@ -401,31 +416,11 @@ def forecast_hourly(home_id: str):
 
 @app.get("/forecast/daily/{home_id}", dependencies=[Depends(require_api_key)])
 def forecast_daily(home_id: str):
-    """
-    Returns the latest pre-computed daily (tomorrow) forecast.
-    Updated at midnight by the scheduler.
-    """
     _check_home(home_id)
     result = get_latest_forecast(home_id, "daily_forecast")
     if not result:
         raise HTTPException(
             status_code=404, detail="No daily forecast yet. Scheduler runs at midnight."
-        )
-    return {"home_id": home_id, "forecast": result}
-
-
-@app.get("/forecast/monthly/{home_id}", dependencies=[Depends(require_api_key)])
-def forecast_monthly(home_id: str):
-    """
-    Returns the latest pre-computed monthly forecast.
-    Updated on the 1st of each month by the scheduler.
-    """
-    _check_home(home_id)
-    result = get_latest_forecast(home_id, "monthly_forecast")
-    if not result:
-        raise HTTPException(
-            status_code=404,
-            detail="No monthly forecast yet. Scheduler runs on the 1st of each month.",
         )
     return {"home_id": home_id, "forecast": result}
 
@@ -436,14 +431,9 @@ def forecast_custom(
 ):
     """
     On-demand forecast for an arbitrary horizon.
-    Pass either ?hours=X or ?days=X.
-    Routes to the appropriate pre-computed forecast based on the horizon.
-    - Up to 1 hour   → hourly model
-    - 1h to 30 days  → daily model
-    - Beyond 30 days → monthly model
+    Up to 1 hour -> hourly model. Beyond that -> daily model.
     """
     _check_home(home_id)
-
     if hours is None and days is None:
         raise HTTPException(status_code=400, detail="Provide ?hours=X or ?days=X")
 
@@ -452,12 +442,9 @@ def forecast_custom(
     if total_hours <= 1:
         result = get_latest_forecast(home_id, "hourly_forecast")
         model_used = "hourly"
-    elif total_hours <= 720:  # up to 30 days
+    else:
         result = get_latest_forecast(home_id, "daily_forecast")
         model_used = "daily"
-    else:
-        result = get_latest_forecast(home_id, "monthly_forecast")
-        model_used = "monthly"
 
     if not result:
         raise HTTPException(
@@ -473,7 +460,7 @@ def forecast_custom(
     }
 
 
-# ── Scheduler trigger endpoints (called by scheduler.py) ──────────
+# ── Scheduler trigger endpoints (also usable for backfilling) ─────
 
 
 @app.post("/internal/run-hourly/{home_id}", dependencies=[Depends(require_api_key)])
@@ -500,18 +487,6 @@ def trigger_daily(home_id: str):
     return result
 
 
-@app.post("/internal/run-monthly/{home_id}", dependencies=[Depends(require_api_key)])
-def trigger_monthly(home_id: str):
-    _check_home(home_id)
-    agg = get_aggregate(home_id, "-30d")
-    temp_c = get_temperature_mean(home_id, "-30d")
-    if not agg:
-        return {"message": "Not enough data yet"}
-    result = run_monthly_forecast(home_id, agg, temp_c)
-    write_forecast("monthly_forecast", home_id, result, result["forecast_for"])
-    return result
-
-
 # ── Helpers ───────────────────────────────────────────────────────
 
 
@@ -519,7 +494,7 @@ def _check_home(home_id: str):
     if not home_exists(home_id):
         raise HTTPException(
             status_code=404,
-            detail=f"Home '{home_id}' not registered. Call POST /homes/register first.",
+            detail=f"Home '{home_id}' not registered. It will appear automatically once the device sends its first reading, or you can call POST /homes/register.",
         )
 
 
@@ -527,7 +502,6 @@ def _horizon_note(model: str) -> str:
     notes = {
         "hourly": "Trained on hourly data. Reliable up to ~1 hour ahead.",
         "daily": "Trained on daily summaries. Best for day-level estimates.",
-        "monthly": "Trained on monthly summaries. Broad trend only.",
     }
     return notes.get(model, "")
 
