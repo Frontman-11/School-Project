@@ -97,7 +97,22 @@ def delete_home_data(home_id: str):
 # ── Sensor + prediction writes ─────────────────────────────────────
 
 
-def write_sensor_reading(payload: dict, recorded_at: datetime):
+def write_points(points: list):
+    """
+    Writes multiple Points in a single HTTP request. Used to batch an
+    entire /ingest cycle's writes (sensor reading, model saves,
+    pipeline state, prediction) into one call instead of six separate
+    ones -- InfluxDB Cloud's free tier throttles on write REQUEST
+    volume, not data size, and six requests per reading at a 10s
+    interval was enough to hit that limit on its own.
+    """
+    if points:
+        _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
+
+
+def write_sensor_reading(
+    payload: dict, recorded_at: datetime, points: list | None = None
+):
     gen = _get_current_generation(payload["home_id"])
     if os.getenv("DEBUG_INFLUX_QUERIES"):
         print(
@@ -122,10 +137,15 @@ def write_sensor_reading(payload: dict, recorded_at: datetime):
         .field("interval_s", int(payload.get("interval_s", 300)))
         .time(recorded_at, WritePrecision.S)
     )
-    _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    if points is not None:
+        points.append(point)
+    else:
+        _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
 
 
-def write_model_prediction(result: dict, home_id: str, recorded_at: datetime):
+def write_model_prediction(
+    result: dict, home_id: str, recorded_at: datetime, points: list | None = None
+):
     gen = _get_current_generation(home_id)
     weather = result.get("weather", {})
     point = (
@@ -159,7 +179,10 @@ def write_model_prediction(result: dict, home_id: str, recorded_at: datetime):
                 "load_abs_pct_error", float(drift["load_abs_pct_error"])
             )
     point = point.time(recorded_at, WritePrecision.S)
-    _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    if points is not None:
+        points.append(point)
+    else:
+        _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
 
 
 def write_forecast(measurement: str, home_id: str, fields: dict, forecast_for: str):
@@ -460,10 +483,12 @@ def list_home_ids() -> list[str]:
     """
     query = f'''
     import "influxdata/influxdb/schema"
-    from(bucket: "{INFLUX_BUCKET}")
-      |> range(start: -365d)
-      |> filter(fn: (r) => r._measurement == "home_config")
-      |> schema.tagValues(tag: "home_id")
+    schema.tagValues(
+      bucket: "{INFLUX_BUCKET}",
+      tag: "home_id",
+      predicate: (r) => r._measurement == "home_config",
+      start: -365d,
+    )
     '''
     try:
         tables = _query_api.query(query)
