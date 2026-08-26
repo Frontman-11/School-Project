@@ -93,10 +93,15 @@ def compute_physics(data: dict) -> dict:
     # Runtime uses the directly-measured battery discharge rate, not the
     # AC-side load estimate, so it is not affected by the load power
     # factor assumption or by unmeasured inverter conversion losses.
+    # None (not 0) when the battery is charging or idle: there is no
+    # discharge to divide by, so runtime is genuinely undefined rather
+    # than zero. Sending 0 made the app show "0 min remaining / LOW"
+    # next to a full battery, because 0 is a real number that passes
+    # every "is there a value?" check downstream.
     runtime = (
         (soc_physics * cap) / battery_discharge_power
         if battery_discharge_power > 0
-        else 0
+        else None
     )
 
     return {
@@ -107,7 +112,7 @@ def compute_physics(data: dict) -> dict:
         "battery_power_flow": round(battery_power_flow, 3),
         "battery_discharge_power": round(battery_discharge_power, 3),
         "soc_physics": round(soc_physics, 4),
-        "runtime_physics": round(runtime, 3),
+        "runtime_physics": round(runtime, 3) if runtime is not None else None,
     }
 
 
@@ -282,7 +287,7 @@ def predict(data: dict) -> dict:
     runtime = (
         (soc_corrected * cap) / physics["battery_discharge_power"]
         if physics["battery_discharge_power"] > 0
-        else 0
+        else None
     )
 
     save_pipeline_state(
@@ -316,7 +321,7 @@ def predict(data: dict) -> dict:
         "soc_now_percent": round(soc_corrected * 100, 1),
         "solar_next_w": round(solar_next, 2),
         "load_next_w": round(load_next, 2),
-        "runtime_hours": round(runtime, 2),
+        "runtime_hours": round(runtime, 2) if runtime is not None else None,
         "soc_physics_pct": round(physics["soc_physics"] * 100, 1),
         "soc_coulomb_pct": round(soc_coulomb * 100, 1),
         "weather": {

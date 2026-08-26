@@ -159,7 +159,12 @@ def write_model_prediction(
         .field("soc_now_percent", float(result["soc_now_percent"]))
         .field("solar_next_w", float(result["solar_next_w"]))
         .field("load_next_w", float(result["load_next_w"]))
-        .field("runtime_hours", float(result["runtime_hours"]))
+        .field(
+            "runtime_hours",
+            float(result["runtime_hours"])
+            if result.get("runtime_hours") is not None
+            else -1.0,  # sentinel: not discharging, runtime undefined
+        )
         .field("soc_physics_pct", float(result["soc_physics_pct"]))
         .field("soc_coulomb_pct", float(result["soc_coulomb_pct"]))
         .field("cloud_cover_pct", float(weather.get("cloud_cover_pct", 50.0)))
