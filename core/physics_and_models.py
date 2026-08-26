@@ -23,12 +23,29 @@ from db.influx_client import load_pipeline_state, save_pipeline_state
 
 
 def voltage_to_soc(voltage: float, curve: list) -> float:
+    """
+    Interpolates state of charge from terminal voltage against a
+    chemistry/voltage-specific lookup curve.
+
+    The result is clamped to 0-100%. Without that clamp, a voltage above
+    the curve's top point extrapolates past 100% -- e.g. a battery
+    sitting at 13.4V read against the 12V LEAD_ACID curve (which tops
+    out at 12.70V) returned 135%, which then fed a nonsense runtime
+    estimate and constantly re-anchored the Coulomb counter to a value
+    that could never be right. Voltage outside the curve's range now
+    pins to the nearest endpoint instead of running off the end of it.
+    """
+    v_top, soc_top = curve[0]
+    if voltage >= v_top:
+        return soc_top
+
     for i in range(len(curve) - 1):
         v_high, soc_high = curve[i]
         v_low, soc_low = curve[i + 1]
         if voltage >= v_low:
             ratio = (voltage - v_low) / (v_high - v_low)
-            return soc_low + ratio * (soc_high - soc_low)
+            soc = soc_low + ratio * (soc_high - soc_low)
+            return min(max(soc, 0.0), 1.0)
     return 0.0
 
 

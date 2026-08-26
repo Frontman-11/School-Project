@@ -32,7 +32,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Literal
 
 import httpx
 import paho.mqtt.client as mqtt
@@ -60,7 +60,7 @@ from db.influx_client import (
     get_aggregate,
     get_temperature_mean,
     get_latest_forecast,
-    get_hourly_history,
+    get_history_log,
     load_pipeline_state,
     delete_home_data,
 )
@@ -244,9 +244,13 @@ class HomeConfig(BaseModel):
     home_id: str
     lat: float
     lon: float
-    battery_type: str = "LEAD_ACID"
-    nominal_voltage: str = "12V"
-    battery_capacity_wh: int = 100
+    # Literal so a bad value is rejected here (422 with a clear message)
+    # instead of crashing the ingest pipeline later at
+    # VOLTAGE_SOC_CURVE[battery_type][nominal_voltage].
+    battery_type: Literal["LEAD_ACID", "LIFEPO4"] = "LEAD_ACID"
+    nominal_voltage: Literal["12V", "24V", "48V"] = "12V"
+    # Wh values can be fractional; int would 422 on e.g. 1200.5.
+    battery_capacity_wh: float = 100
 
 
 # ── Health ────────────────────────────────────────────────────────
@@ -377,12 +381,12 @@ def current(home_id: str):
 @app.get("/history/{home_id}", dependencies=[Depends(require_api_key)])
 def history(home_id: str, hours: int = 24):
     """
-    Hourly actual vs predicted solar/load power. Default is the last
-    24 hours; pass ?hours=48 or ?hours=168 to look further back
-    ("as at yesterday", "a few hours ago", etc).
+    Per-reading log of actual vs predicted solar/load power. Default is
+    the last 24 hours; pass ?hours=48 or ?hours=168 to look further back.
+    Pass ?hours=0 for all available data.
     """
     _check_home(home_id)
-    rows = get_hourly_history(home_id, hours=hours)
+    rows = get_history_log(home_id, hours=hours)
     if not rows:
         raise HTTPException(status_code=404, detail="No data yet for this home")
     return {"home_id": home_id, "period": f"last_{hours}h", "hours": rows}

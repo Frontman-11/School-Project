@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+from utils.constants import NOMINAL_AC_VOLTAGE_V
 
 load_dotenv()
 
@@ -357,7 +358,7 @@ def get_hourly_history(home_id: str, hours: int = 24) -> list[dict]:
     yesterday" / "hours ago" lookback by increasing `hours`.
     """
     gen = _get_current_generation(home_id)
-    range_str = f"-{hours}h"
+    range_str = "0" if hours <= 0 else f"-{hours}h"
 
     def _run(query: str) -> dict[str, float]:
         try:
@@ -614,3 +615,79 @@ def load_pipeline_state(home_id: str, kind: str) -> dict | None:
     except Exception as e:
         print(f"[InfluxDB] load_pipeline_state({kind}) error: {e}")
         return None
+
+
+def get_history_log(home_id: str, hours: int = 24) -> list[dict]:
+    """
+    Per-reading history, joining sensor_reading and model_prediction at
+    matching timestamps. No extra measurement needed -- both are already
+    written on every ingest.
+
+    solar_actual and load_actual are recomputed here with exactly the
+    same formulas compute_physics() uses, so the history screen and the
+    live dashboard can never disagree about what "actual" means:
+      solar  = panel_voltage x panel_current            (W, DC, exact)
+      load   = NOMINAL_AC_VOLTAGE_V x load_current      (VA, apparent)
+    An earlier version of this used battery_voltage x load_current for
+    the load figure, which mixes the DC battery rail with an AC-side
+    current reading -- it produced numbers roughly 18x too small and
+    disagreed with load_power_now_w everywhere else in the system.
+    """
+    gen = _get_current_generation(home_id)
+    range_str = "0" if hours <= 0 else f"-{hours}h"
+
+    def _query(fields: str, measurement: str) -> dict[str, dict]:
+        query = f'''
+        from(bucket: "{INFLUX_BUCKET}")
+          |> range(start: {range_str})
+          |> filter(fn: (r) => r._measurement == "{measurement}")
+          |> filter(fn: (r) => r.home_id == "{home_id}")
+          |> filter(fn: (r) => r.generation == "{gen}")
+          |> filter(fn: (r) => {fields})
+          |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        '''
+        try:
+            tables = _query_api.query(query)
+            out: dict[str, dict] = {}
+            for table in tables:
+                for record in table.records:
+                    ts = record.get_time().strftime("%Y-%m-%d %H:%M")
+                    out[ts] = record.values
+            return out
+        except Exception as e:
+            print(f"[InfluxDB] get_history_log query error: {e}")
+            return {}
+
+    sensor_rows = _query(
+        'r._field == "solar_voltage" or r._field == "solar_current" or r._field == "load_current"',
+        "sensor_reading",
+    )
+    pred_rows = _query(
+        'r._field == "solar_next_w" or r._field == "load_next_w"',
+        "model_prediction",
+    )
+
+    all_times = sorted(set(sensor_rows) | set(pred_rows))
+    entries: list[dict] = []
+    for ts in all_times:
+        s_row = sensor_rows.get(ts, {})
+        p_row = pred_rows.get(ts, {})
+        solar_v = s_row.get("solar_voltage")
+        solar_c = s_row.get("solar_current")
+        load_c = s_row.get("load_current")
+        solar_actual = (
+            round(solar_v * solar_c, 2)
+            if solar_v is not None and solar_c is not None
+            else None
+        )
+        load_actual = (
+            round(NOMINAL_AC_VOLTAGE_V * load_c, 2) if load_c is not None else None
+        )
+        entries.append({
+            "time": ts,
+            "solar_actual": solar_actual,
+            "solar_pred": p_row.get("solar_next_w"),
+            "load_actual": load_actual,
+            "load_pred": p_row.get("load_next_w"),
+        })
+    return entries
