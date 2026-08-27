@@ -28,6 +28,13 @@ _DEBUG_TRUE = {"1", "true", "yes", "on"}
 _MODEL_READ_ATTEMPTS = 3
 _MODEL_READ_RETRY_SECONDS = 0.75
 
+# Search windows for the newest model_state point, narrowest first. A
+# save happens on every reading, so the first window matches in normal
+# operation and the query never has to scan the weeks of superseded
+# blobs sitting behind it. The wider windows exist only for a process
+# resuming after a long outage.
+_MODEL_READ_WINDOWS = ["-2h", "-24h", "-7d", "-35d"]
+
 
 def _debug_enabled() -> bool:
     return os.getenv("DEBUG_INFLUX_QUERIES", "").strip().lower() in _DEBUG_TRUE
@@ -553,6 +560,26 @@ def save_model_blob(home_id: str, model_name: str, blob: str):
     _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
 
 
+def _fetch_model_state(home_id: str, model_name: str, gen: int, window: str) -> dict:
+    """One query for the newest model_state point inside `window`."""
+    query = f'''
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: {window})
+      |> filter(fn: (r) => r._measurement == "model_state")
+      |> filter(fn: (r) => r.home_id == "{home_id}" and r.model_name == "{model_name}")
+      |> filter(fn: (r) => r.generation == "{gen}")
+      |> last()
+    '''
+    tables = _query_api.query(query)
+    fields: dict = {}
+    for table in tables:
+        for record in table.records:
+            v = record.get_value()
+            if v is not None:
+                fields[record.get_field()] = v
+    return fields
+
+
 def load_model_blob(home_id: str, model_name: str) -> str | None:
     """
     Returns the stored blob, or None if no model has been saved yet.
@@ -567,59 +594,62 @@ def load_model_blob(home_id: str, model_name: str) -> str | None:
     save succeeds, so starting fresh is the only way out. A read error
     is the opposite: the stored copy is very likely intact and will be
     readable on the next attempt.
+
+    The search starts from the narrowest window and widens only when
+    nothing is found. save_model_blob writes a NEW point on every save,
+    so model_state accumulates roughly two thousand points per day, each
+    holding a complete serialised model across its chunk fields. Asking
+    for the last point in a 35-day range therefore made InfluxDB scan
+    weeks of accumulated blobs to find one written five minutes ago,
+    which is what produced the 500s seen in deployment. In normal
+    operation the first window matches and the scan covers a couple of
+    dozen points instead of tens of thousands.
     """
     gen = _get_current_generation(home_id)
-    query = f'''
-    from(bucket: "{INFLUX_BUCKET}")
-      |> range(start: -35d)
-      |> filter(fn: (r) => r._measurement == "model_state")
-      |> filter(fn: (r) => r.home_id == "{home_id}" and r.model_name == "{model_name}")
-      |> filter(fn: (r) => r.generation == "{gen}")
-      |> last()
-    '''
-
-    # Serverless has been observed returning a 500 on this query when the
-    # serialised ensemble has grown to many chunks. Those failures are
-    # transient, so a couple of retries usually clears them without the
-    # cycle ever being abandoned.
     last_error = None
-    for attempt in range(_MODEL_READ_ATTEMPTS):
-        try:
-            tables = _query_api.query(query)
-            fields: dict = {}
-            for table in tables:
-                for record in table.records:
-                    v = record.get_value()
-                    if v is not None:
-                        fields[record.get_field()] = v
+    read_failed = False
 
-            if "chunk_count" not in fields:
+    for window in _MODEL_READ_WINDOWS:
+        fields = None
+        for attempt in range(_MODEL_READ_ATTEMPTS):
+            try:
+                fields = _fetch_model_state(home_id, model_name, gen, window)
+                break
+            except Exception as e:
+                last_error = e
+                read_failed = True
+                print(
+                    f"[InfluxDB] load_model_blob({model_name}) read failed over "
+                    f"{window} (attempt {attempt + 1}/{_MODEL_READ_ATTEMPTS}): {e}"
+                )
+                if attempt + 1 < _MODEL_READ_ATTEMPTS:
+                    time.sleep(_MODEL_READ_RETRY_SECONDS * (attempt + 1))
+
+        if fields is None:
+            continue  # every attempt over this window errored; try the next
+        if "chunk_count" not in fields:
+            continue  # nothing stored in this window; widen the search
+
+        chunk_count = int(fields["chunk_count"])
+        parts = []
+        for i in range(chunk_count):
+            key = f"chunk_{i}"
+            if key not in fields:
+                print(
+                    f"[InfluxDB] load_model_blob({model_name}) missing {key} -- partial save, discarding"
+                )
                 return None
+            parts.append(fields[key])
+        return "".join(parts)
 
-            chunk_count = int(fields["chunk_count"])
-            parts = []
-            for i in range(chunk_count):
-                key = f"chunk_{i}"
-                if key not in fields:
-                    print(
-                        f"[InfluxDB] load_model_blob({model_name}) missing {key} -- partial save, discarding"
-                    )
-                    return None
-                parts.append(fields[key])
-            return "".join(parts)
-
-        except Exception as e:
-            last_error = e
-            print(
-                f"[InfluxDB] load_model_blob({model_name}) read failed "
-                f"(attempt {attempt + 1}/{_MODEL_READ_ATTEMPTS}): {e}"
-            )
-            if attempt + 1 < _MODEL_READ_ATTEMPTS:
-                time.sleep(_MODEL_READ_RETRY_SECONDS * (attempt + 1))
+    # Every window came back clean but empty: no model has been saved.
+    if not read_failed:
+        return None
 
     raise ModelStoreUnavailable(
         f"could not read model '{model_name}' for '{home_id}' after "
-        f"{_MODEL_READ_ATTEMPTS} attempts: {last_error}"
+        f"{_MODEL_READ_ATTEMPTS} attempts over {len(_MODEL_READ_WINDOWS)} "
+        f"time windows: {last_error}"
     )
 
 
