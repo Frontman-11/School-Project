@@ -16,7 +16,7 @@ process before) transparently loads from InfluxDB on first use.
 import base64
 import pickle
 from river import ensemble, preprocessing, compose
-from db.influx_client import save_model_blob, load_model_blob
+from db.influx_client import save_model_blob, load_model_blob, ModelStoreUnavailable
 
 FIVE_MIN_MODEL_NAMES = ["solar_5min", "load_5min", "soc_5min"]
 HOURLY_MODEL_NAMES   = ["solar_hourly", "load_hourly"]
@@ -42,6 +42,21 @@ def _decode(blob: str):
 
 
 def _load_one(home_id: str, name: str):
+    """
+    Returns the stored model, or a fresh one if none exists yet.
+
+    Propagates ModelStoreUnavailable rather than swallowing it. That is
+    the whole point of this function: if the read failed we do not know
+    whether a trained model exists, and returning a fresh one here would
+    cause the caller to train a single sample into it and save it back
+    over days of accumulated learning. Letting the exception through
+    abandons the cycle instead, which costs one reading of training and
+    keeps everything that came before it.
+
+    A blob that is present but will not deserialise is a different case.
+    The stored bytes are unusable and no amount of waiting will change
+    that, so a fresh model is the only way forward.
+    """
     blob = load_model_blob(home_id, name)
     if blob:
         try:
@@ -52,10 +67,19 @@ def _load_one(home_id: str, name: str):
 
 
 def _get_bundle(home_id: str, names: list[str]) -> dict:
+    """
+    Loads the named models, using the in-memory cache where possible.
+
+    Nothing is written into the cache unless every requested model
+    loaded cleanly. A partially populated cache would let a later call
+    silently succeed with a blank model for the one that failed, which
+    is the same data loss this module now exists to prevent.
+    """
     bundle = _cache.setdefault(home_id, {})
-    for name in names:
-        if name not in bundle:
-            bundle[name] = _load_one(home_id, name)
+    missing = [name for name in names if name not in bundle]
+    if missing:
+        loaded = {name: _load_one(home_id, name) for name in missing}
+        bundle.update(loaded)
     return {name: bundle[name] for name in names}
 
 

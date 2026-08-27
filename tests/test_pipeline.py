@@ -322,3 +322,88 @@ def test_history_load_matches_live_load_formula():
     assert physics["load_power_physics"] == expected_load
     # and the wrong (battery-rail) formula must NOT match it
     assert abs(physics["load_power_physics"] - abs(data["battery_voltage"] * data["load_current"])) > 1.0
+
+
+# ── Model store read failures must not destroy training ────────────
+#
+# Regression tests for the failure observed in deployment on 27 August
+# 2026, where InfluxDB returned a 500 on load_model_blob and every
+# affected model was silently replaced by an untrained one and saved
+# back over days of accumulated learning.
+
+
+def test_read_failure_raises_instead_of_returning_a_blank_model(fake_backend):
+    """A read error must propagate, not masquerade as 'no model yet'."""
+    import core.model_store as ms
+    from db.influx_client import ModelStoreUnavailable
+
+    def exploding_load(home_id, model_name):
+        raise ModelStoreUnavailable("simulated InfluxDB 500")
+
+    ms.load_model_blob = exploding_load
+    ms._cache.clear()
+
+    with pytest.raises(ModelStoreUnavailable):
+        ms.get_five_min_models("home1")
+
+
+def test_read_failure_leaves_the_stored_model_untouched(fake_backend):
+    """
+    The damaging part was never the failed read, it was the save that
+    followed it. Nothing may be written when the read failed.
+    """
+    import core.model_store as ms
+    from db.influx_client import ModelStoreUnavailable
+
+    ms._cache.clear()
+    trained = ms.get_five_min_models("home1")
+    ms.save_models("home1", trained)
+    before = dict(fake_backend["model_blobs"])
+    assert before, "a baseline model should have been stored"
+
+    ms._cache.clear()
+    ms.load_model_blob = lambda h, n: (_ for _ in ()).throw(
+        ModelStoreUnavailable("simulated InfluxDB 500")
+    )
+
+    with pytest.raises(ModelStoreUnavailable):
+        ms.get_five_min_models("home1")
+
+    assert fake_backend["model_blobs"] == before
+
+
+def test_absent_model_still_starts_fresh(fake_backend):
+    """
+    The fix must not break the genuine cold-start case: no stored model
+    means a new one, with no exception raised.
+    """
+    import core.model_store as ms
+
+    ms._cache.clear()
+    models = ms.get_five_min_models("a_home_never_seen_before")
+    assert set(models) == {"solar_5min", "load_5min", "soc_5min"}
+    for model in models.values():
+        assert model is not None
+
+
+def test_cache_is_not_populated_when_a_load_fails(fake_backend):
+    """
+    A half-filled cache would let a later call quietly succeed with a
+    blank model for whichever one failed.
+    """
+    import core.model_store as ms
+    from db.influx_client import ModelStoreUnavailable
+
+    ms._cache.clear()
+
+    def load_only_the_first(home_id, model_name):
+        if model_name == "solar_5min":
+            return None
+        raise ModelStoreUnavailable("simulated InfluxDB 500")
+
+    ms.load_model_blob = load_only_the_first
+
+    with pytest.raises(ModelStoreUnavailable):
+        ms.get_five_min_models("home1")
+
+    assert not ms._cache.get("home1")

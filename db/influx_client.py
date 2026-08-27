@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WritePrecision
@@ -22,9 +23,30 @@ _write_api = _client.write_api(write_options=SYNCHRONOUS)
 # "false", so the flag could be set but never cleared.
 _DEBUG_TRUE = {"1", "true", "yes", "on"}
 
+# Reading a model blob can fail transiently. Retry before giving up,
+# because giving up costs a whole training cycle.
+_MODEL_READ_ATTEMPTS = 3
+_MODEL_READ_RETRY_SECONDS = 0.75
+
 
 def _debug_enabled() -> bool:
     return os.getenv("DEBUG_INFLUX_QUERIES", "").strip().lower() in _DEBUG_TRUE
+
+
+class ModelStoreUnavailable(Exception):
+    """
+    Raised when the stored model state could not be READ -- a query
+    error, a timeout, a 5xx from InfluxDB.
+
+    This is deliberately distinct from load_model_blob() returning None,
+    which means "there is genuinely no model stored yet". Collapsing the
+    two is how training gets destroyed: a read failure that looks like
+    "no model yet" causes the caller to build a fresh untrained model,
+    train one sample into it, and save it back over a model that had
+    been learning for days. The stored copy is fine; only our ability to
+    read it failed, so the correct response is to abandon this cycle and
+    leave the stored copy alone.
+    """
 
 
 # InfluxDB's hard ceiling is 64KB (65536 bytes) per string field. Base64
@@ -532,6 +554,20 @@ def save_model_blob(home_id: str, model_name: str, blob: str):
 
 
 def load_model_blob(home_id: str, model_name: str) -> str | None:
+    """
+    Returns the stored blob, or None if no model has been saved yet.
+
+    Raises ModelStoreUnavailable if the read itself failed. The caller
+    must treat that as "unknown", never as "absent" -- see the exception
+    docstring.
+
+    A blob that is present but unusable (an interrupted save that left a
+    chunk missing) returns None rather than raising. That state cannot
+    be recovered by waiting, since nothing will repair it until a new
+    save succeeds, so starting fresh is the only way out. A read error
+    is the opposite: the stored copy is very likely intact and will be
+    readable on the next attempt.
+    """
     gen = _get_current_generation(home_id)
     query = f'''
     from(bucket: "{INFLUX_BUCKET}")
@@ -541,32 +577,50 @@ def load_model_blob(home_id: str, model_name: str) -> str | None:
       |> filter(fn: (r) => r.generation == "{gen}")
       |> last()
     '''
-    try:
-        tables = _query_api.query(query)
-        fields: dict = {}
-        for table in tables:
-            for record in table.records:
-                v = record.get_value()
-                if v is not None:
-                    fields[record.get_field()] = v
 
-        if "chunk_count" not in fields:
-            return None
+    # Serverless has been observed returning a 500 on this query when the
+    # serialised ensemble has grown to many chunks. Those failures are
+    # transient, so a couple of retries usually clears them without the
+    # cycle ever being abandoned.
+    last_error = None
+    for attempt in range(_MODEL_READ_ATTEMPTS):
+        try:
+            tables = _query_api.query(query)
+            fields: dict = {}
+            for table in tables:
+                for record in table.records:
+                    v = record.get_value()
+                    if v is not None:
+                        fields[record.get_field()] = v
 
-        chunk_count = int(fields["chunk_count"])
-        parts = []
-        for i in range(chunk_count):
-            key = f"chunk_{i}"
-            if key not in fields:
-                print(
-                    f"[InfluxDB] load_model_blob({model_name}) missing {key} -- partial save, discarding"
-                )
+            if "chunk_count" not in fields:
                 return None
-            parts.append(fields[key])
-        return "".join(parts)
-    except Exception as e:
-        print(f"[InfluxDB] load_model_blob({model_name}) error: {e}")
-        return None
+
+            chunk_count = int(fields["chunk_count"])
+            parts = []
+            for i in range(chunk_count):
+                key = f"chunk_{i}"
+                if key not in fields:
+                    print(
+                        f"[InfluxDB] load_model_blob({model_name}) missing {key} -- partial save, discarding"
+                    )
+                    return None
+                parts.append(fields[key])
+            return "".join(parts)
+
+        except Exception as e:
+            last_error = e
+            print(
+                f"[InfluxDB] load_model_blob({model_name}) read failed "
+                f"(attempt {attempt + 1}/{_MODEL_READ_ATTEMPTS}): {e}"
+            )
+            if attempt + 1 < _MODEL_READ_ATTEMPTS:
+                time.sleep(_MODEL_READ_RETRY_SECONDS * (attempt + 1))
+
+    raise ModelStoreUnavailable(
+        f"could not read model '{model_name}' for '{home_id}' after "
+        f"{_MODEL_READ_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 # ── Pipeline (train/predict pairing) state persistence ─────────────
