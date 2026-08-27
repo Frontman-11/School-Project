@@ -17,6 +17,16 @@ _client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 _query_api = _client.query_api()
 _write_api = _client.write_api(write_options=SYNCHRONOUS)
 
+# Truthy environment values only. Testing the raw os.getenv result meant
+# any non-empty string switched debug logging ON, including "0" and
+# "false", so the flag could be set but never cleared.
+_DEBUG_TRUE = {"1", "true", "yes", "on"}
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("DEBUG_INFLUX_QUERIES", "").strip().lower() in _DEBUG_TRUE
+
+
 # InfluxDB's hard ceiling is 64KB (65536 bytes) per string field. Base64
 # text is 1 byte per character, so this leaves comfortable headroom.
 _MODEL_CHUNK_SIZE = 60000
@@ -51,7 +61,7 @@ _generation_cache: dict[str, int] = {}
 
 def _get_current_generation(home_id: str) -> int:
     if home_id in _generation_cache:
-        if os.getenv("DEBUG_INFLUX_QUERIES"):
+        if _debug_enabled():
             print(
                 f"[InfluxDB DEBUG] _get_current_generation({home_id}) cache hit -> {_generation_cache[home_id]}"
             )
@@ -76,7 +86,7 @@ def _get_current_generation(home_id: str) -> int:
     except Exception as e:
         print(f"[InfluxDB] _get_current_generation error: {e}")
     _generation_cache[home_id] = gen
-    if os.getenv("DEBUG_INFLUX_QUERIES"):
+    if _debug_enabled():
         print(
             f"[InfluxDB DEBUG] _get_current_generation({home_id}) queried InfluxDB -> {gen}"
         )
@@ -98,24 +108,9 @@ def delete_home_data(home_id: str):
 # ── Sensor + prediction writes ─────────────────────────────────────
 
 
-def write_points(points: list):
-    """
-    Writes multiple Points in a single HTTP request. Used to batch an
-    entire /ingest cycle's writes (sensor reading, model saves,
-    pipeline state, prediction) into one call instead of six separate
-    ones -- InfluxDB Cloud's free tier throttles on write REQUEST
-    volume, not data size, and six requests per reading at a 10s
-    interval was enough to hit that limit on its own.
-    """
-    if points:
-        _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
-
-
-def write_sensor_reading(
-    payload: dict, recorded_at: datetime, points: list | None = None
-):
+def write_sensor_reading(payload: dict, recorded_at: datetime):
     gen = _get_current_generation(payload["home_id"])
-    if os.getenv("DEBUG_INFLUX_QUERIES"):
+    if _debug_enabled():
         print(
             f"[InfluxDB DEBUG] write_sensor_reading(home_id={payload['home_id']}, generation={gen}, recorded_at={recorded_at.isoformat()})"
         )
@@ -138,15 +133,10 @@ def write_sensor_reading(
         .field("interval_s", int(payload.get("interval_s", 300)))
         .time(recorded_at, WritePrecision.S)
     )
-    if points is not None:
-        points.append(point)
-    else:
-        _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
 
 
-def write_model_prediction(
-    result: dict, home_id: str, recorded_at: datetime, points: list | None = None
-):
+def write_model_prediction(result: dict, home_id: str, recorded_at: datetime):
     gen = _get_current_generation(home_id)
     weather = result.get("weather", {})
     point = (
@@ -185,10 +175,7 @@ def write_model_prediction(
                 "load_abs_pct_error", float(drift["load_abs_pct_error"])
             )
     point = point.time(recorded_at, WritePrecision.S)
-    if points is not None:
-        points.append(point)
-    else:
-        _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
 
 
 def write_forecast(measurement: str, home_id: str, fields: dict, forecast_for: str):
@@ -232,7 +219,7 @@ def _last_fields(
                         recorded_time = record.get_time()
         if recorded_time is not None:
             result["recorded_at"] = recorded_time.isoformat()
-        if os.getenv("DEBUG_INFLUX_QUERIES"):
+        if _debug_enabled():
             print(
                 f"[InfluxDB DEBUG] _last_fields({measurement}, home_id={home_id}, generation={gen}): "
                 f"{len(tables)} table(s), result={result if result else None}"

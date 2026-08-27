@@ -13,6 +13,12 @@ from utils.constants import (
     encode_day,
     encode_month,
     NOMINAL_AC_VOLTAGE_V,
+    SOC_REANCHOR_THRESHOLD,
+    SOC_REST_CURRENT_A,
+    MIN_DISCHARGE_FOR_RUNTIME_W,
+    MAX_RUNTIME_HOURS,
+    MAX_PLAUSIBLE_SOLAR_W,
+    MAX_PLAUSIBLE_LOAD_VA,
 )
 from utils.weather import get_weather
 from core import model_store
@@ -73,7 +79,7 @@ def coulomb_counting_soc(
 def compute_physics(data: dict) -> dict:
     solar_power = data["solar_voltage"] * data["solar_current"]
 
-    # Load side: SCT-013-030 measures AC RMS current with no voltage or
+    # Load side: SCT-013-050 measures AC RMS current with no voltage or
     # phase reference, so apparent power (V_nominal x I_rms) is the only
     # quantity computed -- no power factor assumption is made anywhere.
     load_apparent_power = NOMINAL_AC_VOLTAGE_V * data["load_current"]
@@ -98,11 +104,20 @@ def compute_physics(data: dict) -> dict:
     # than zero. Sending 0 made the app show "0 min remaining / LOW"
     # next to a full battery, because 0 is a real number that passes
     # every "is there a value?" check downstream.
-    runtime = (
-        (soc_physics * cap) / battery_discharge_power
-        if battery_discharge_power > 0
-        else None
-    )
+    #
+    # The discharge floor matters as much as the zero check. Testing only
+    # for "> 0" let the quotient run away whenever the battery was
+    # trickling at the noise floor of the current measurement: 142 of 209
+    # defined runtimes exceeded 100 h and the largest reached 56,219 h on
+    # a 2.5 kWh battery. Below the floor the answer is undefined, not
+    # enormous, and above it the result is capped.
+    if battery_discharge_power >= MIN_DISCHARGE_FOR_RUNTIME_W:
+        runtime = min(
+            (soc_physics * cap) / battery_discharge_power,
+            MAX_RUNTIME_HOURS,
+        )
+    else:
+        runtime = None
 
     return {
         "solar_power_physics": round(solar_power, 3),
@@ -249,7 +264,19 @@ def predict(data: dict) -> dict:
             )
         else:
             soc_coulomb = last["soc_estimate"]
-        if abs(soc_coulomb - physics["soc_physics"]) > 0.3:
+        # Re-anchor to the voltage curve either when the battery is at
+        # rest, where terminal voltage is the most trustworthy indicator
+        # available, or when the two estimates have drifted apart. The
+        # rest condition exists because the drift test alone is not
+        # enough: a counter saturated at 1.00 against a voltage estimate
+        # of 0.79 differs by only 0.21 and would sit there indefinitely
+        # behind a looser threshold, which is what happened in
+        # deployment.
+        at_rest = abs(data["battery_current"]) < SOC_REST_CURRENT_A
+        drifted = (
+            abs(soc_coulomb - physics["soc_physics"]) > SOC_REANCHOR_THRESHOLD
+        )
+        if at_rest or drifted:
             soc_coulomb = physics["soc_physics"]
     else:
         soc_coulomb = physics["soc_physics"]
@@ -271,8 +298,18 @@ def predict(data: dict) -> dict:
         solar_next = physics["solar_power_physics"]
     if load_next is None or (load_next <= 0 and physics["load_power_physics"] > 0):
         load_next = physics["load_power_physics"]
-    if soc_corrected is None or abs(soc_corrected - soc_coulomb) > 0.3:
+    if soc_corrected is None or abs(soc_corrected - soc_coulomb) > SOC_REANCHOR_THRESHOLD:
         soc_corrected = soc_coulomb
+
+    # Upper bounds. The checks above only catch a model that collapses
+    # toward zero; nothing caught one that diverged upward, and the
+    # hourly model once produced 6.87e13 W, which was stored and served.
+    # A forecast beyond what the installation can physically do is a
+    # diverged model, so fall back to the physics estimate.
+    if solar_next > MAX_PLAUSIBLE_SOLAR_W:
+        solar_next = physics["solar_power_physics"]
+    if load_next > MAX_PLAUSIBLE_LOAD_VA:
+        load_next = physics["load_power_physics"]
 
     solar_next = max(solar_next, 0)
     load_next = max(load_next, 0)
@@ -283,12 +320,13 @@ def predict(data: dict) -> dict:
     # rather than the ML-forecast AC load figure -- this keeps it free
     # of both the load power factor assumption and the model's own
     # short-horizon forecast noise, at the cost of not anticipating a
-    # load change in the next 5 minutes. See compute_physics for why.
-    runtime = (
-        (soc_corrected * cap) / physics["battery_discharge_power"]
-        if physics["battery_discharge_power"] > 0
-        else None
-    )
+    # load change in the next 5 minutes. See compute_physics for why,
+    # including why the discharge floor and the cap are both needed.
+    discharge = physics["battery_discharge_power"]
+    if discharge >= MIN_DISCHARGE_FOR_RUNTIME_W:
+        runtime = min((soc_corrected * cap) / discharge, MAX_RUNTIME_HOURS)
+    else:
+        runtime = None
 
     save_pipeline_state(
         home_id,
@@ -310,7 +348,7 @@ def predict(data: dict) -> dict:
         "recorded_at": data["recorded_at"],
         "forecast_for": forecast_for.isoformat(),
         # NOTE: load_power_now_w / load_next_w are APPARENT power (VA),
-        # not active power (W) -- the SCT-013-030 clamp has no voltage
+        # not active power (W) -- the SCT-013-050 clamp has no voltage
         # or phase reference, so V_nominal x I_rms is the only quantity
         # computed. No power factor is assumed anywhere in this system.
         # Field names kept as *_w for compatibility with the existing

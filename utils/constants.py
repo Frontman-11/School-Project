@@ -109,7 +109,7 @@ def encode_month(month: int) -> dict:
 
 # ── AC load-side assumptions ───────────────────────────────────────
 #
-# The load-side SCT-013-030 clamp measures AC RMS current only -- it
+# The load-side SCT-013-050 clamp measures AC RMS current only -- it
 # has no voltage or phase reference. Without a dedicated AC voltage
 # sensing circuit (e.g. a ZMPT101B synced to the current sampling),
 # active/real power (P = V x I x cos(phi)) cannot be measured, since
@@ -117,3 +117,52 @@ def encode_month(month: int) -> dict:
 # (S = V_rms x I_rms) is computed, using this fixed nominal voltage in
 # place of a real measurement. No power factor is assumed anywhere.
 NOMINAL_AC_VOLTAGE_V = 240.0  # Nigeria mains, RMS, 50Hz
+
+
+# ── State of charge estimator bounds ───────────────────────────────
+#
+# Maximum tolerated divergence between the Coulomb-counted estimate and
+# the voltage-based estimate before the counter is re-anchored to the
+# voltage curve.
+#
+# This was 0.3, and that value produced a trapped estimator in
+# deployment. The Coulomb integration is clamped to a maximum of 1.0, so
+# once it saturates at full charge it can only come down again if the
+# re-anchoring test fires. With the voltage estimate near 0.79 and the
+# counter at 1.00 the divergence is 0.21 -- large enough to be plainly
+# wrong, but never large enough to trigger a 0.3 threshold. The reported
+# state of charge sat at 100.0% for 286 consecutive readings as a result.
+SOC_REANCHOR_THRESHOLD = 0.12
+
+# A battery with little current flowing either way has a terminal
+# voltage that reflects its true state of charge, so at those moments
+# the counter is re-anchored unconditionally regardless of divergence.
+# This gives the estimator a way back to truth that does not depend on
+# the drift threshold firing at all.
+SOC_REST_CURRENT_A = 0.25
+
+
+# ── Runtime estimate bounds ────────────────────────────────────────
+#
+# Runtime is stored energy divided by discharge power. Below this
+# discharge rate the quotient is dominated by the noise floor of the
+# current measurement rather than by any real drain, and the result is
+# not meaningful -- values above 56,000 hours were produced on a 2.5 kWh
+# battery before this bound existed.
+MIN_DISCHARGE_FOR_RUNTIME_W = 5.0
+
+# No residential runtime estimate beyond three days carries information
+# a household can act on, so the figure is capped rather than reported.
+MAX_RUNTIME_HOURS = 72.0
+
+
+# ── Forecast plausibility bounds ───────────────────────────────────
+#
+# Every other sanity check in the system tests only for values at or
+# below zero, so a regressor that diverges upward passes through
+# unchecked. The hourly solar model once wrote 6.87e13 W, which was
+# stored and served to the app. These bounds are set well above anything
+# the installation can physically produce or draw, so they reject
+# divergence without ever clipping a genuine forecast.
+MAX_PLAUSIBLE_SOLAR_W = 1000.0
+MAX_PLAUSIBLE_LOAD_VA = 2000.0

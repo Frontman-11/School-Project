@@ -6,7 +6,13 @@ forecast the app was not using.
 """
 
 from datetime import datetime, timezone, timedelta
-from utils.constants import encode_hour, encode_day, encode_month
+from utils.constants import (
+    encode_hour,
+    encode_day,
+    encode_month,
+    MAX_PLAUSIBLE_SOLAR_W,
+    MAX_PLAUSIBLE_LOAD_VA,
+)
 from core import model_store
 from db.influx_client import load_pipeline_state, save_pipeline_state
 
@@ -64,6 +70,14 @@ def run_hourly_forecast(home_id: str, agg: dict, temp_c: float) -> dict:
     if load_h is None or (load_h <= 0 and agg.get("load_power_now_w", 0) > 0):
         load_h = agg.get("load_power_now_w", 0.0)
 
+    # Upper bounds. Without these an upward divergence is stored and
+    # served: this model wrote 6.87e13 W on 26 August 2026 and the value
+    # reached the app unchallenged.
+    if solar_h > MAX_PLAUSIBLE_SOLAR_W:
+        solar_h = agg.get("solar_power_now_w", 0.0)
+    if load_h > MAX_PLAUSIBLE_LOAD_VA:
+        load_h = agg.get("load_power_now_w", 0.0)
+
     save_pipeline_state(home_id, "hourly", {"features": features, "recorded_at": now.isoformat()})
 
     return {
@@ -96,6 +110,14 @@ def run_daily_forecast(home_id: str, agg: dict, temp_c: float) -> dict:
     if solar_d is None:
         solar_d = features["total_solar_wh"]
     if load_d is None:
+        load_d = features["mean_load_w"]
+
+    # The daily solar figure is an energy over 24 h rather than a power,
+    # so its bound is scaled accordingly. The load figure remains a mean
+    # power and uses the bound unscaled.
+    if solar_d > MAX_PLAUSIBLE_SOLAR_W * 24:
+        solar_d = features["total_solar_wh"]
+    if load_d > MAX_PLAUSIBLE_LOAD_VA:
         load_d = features["mean_load_w"]
 
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
