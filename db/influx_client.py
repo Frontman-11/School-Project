@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -560,24 +560,62 @@ def save_model_blob(home_id: str, model_name: str, blob: str):
     _write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
 
 
-def _fetch_model_state(home_id: str, model_name: str, gen: int, window: str) -> dict:
-    """One query for the newest model_state point inside `window`."""
+def _fetch_model_field(home_id: str, model_name: str, gen: int,
+                       window: str, field: str):
+    """
+    Newest value of ONE field, with its timestamp.
+
+    Restricting the query to a single field is the entire point. Asking
+    for every field at once returns the complete serialised model in one
+    response, and model_state is the only measurement in this system
+    holding large string fields -- every other last() call in the app
+    reads floats and has never failed. Pulling one field at a time keeps
+    each response to a single chunk.
+    """
     query = f'''
     from(bucket: "{INFLUX_BUCKET}")
       |> range(start: {window})
       |> filter(fn: (r) => r._measurement == "model_state")
       |> filter(fn: (r) => r.home_id == "{home_id}" and r.model_name == "{model_name}")
       |> filter(fn: (r) => r.generation == "{gen}")
+      |> filter(fn: (r) => r._field == "{field}")
       |> last()
     '''
-    tables = _query_api.query(query)
-    fields: dict = {}
-    for table in tables:
+    for table in _query_api.query(query):
         for record in table.records:
             v = record.get_value()
             if v is not None:
-                fields[record.get_field()] = v
-    return fields
+                return v, record.get_time()
+    return None, None
+
+
+def _fetch_model_field_at(home_id: str, model_name: str, gen: int,
+                          field: str, at):
+    """
+    One field, pinned to the exact save it belongs to.
+
+    Each chunk is fetched in its own query, so without pinning the time
+    two chunks could come from different saves and reassemble into a
+    blob that never existed. A one-second window either side of the
+    chunk_count timestamp keeps every chunk from the same write.
+    """
+    start = (at - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    stop = (at + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    query = f'''
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: {start}, stop: {stop})
+      |> filter(fn: (r) => r._measurement == "model_state")
+      |> filter(fn: (r) => r.home_id == "{home_id}" and r.model_name == "{model_name}")
+      |> filter(fn: (r) => r.generation == "{gen}")
+      |> filter(fn: (r) => r._field == "{field}")
+      |> last()
+    '''
+    for table in _query_api.query(query):
+        for record in table.records:
+            v = record.get_value()
+            if v is not None:
+                return v
+    return None
 
 
 def load_model_blob(home_id: str, model_name: str) -> str | None:
@@ -595,51 +633,73 @@ def load_model_blob(home_id: str, model_name: str) -> str | None:
     is the opposite: the stored copy is very likely intact and will be
     readable on the next attempt.
 
-    The search starts from the narrowest window and widens only when
-    nothing is found. save_model_blob writes a NEW point on every save,
-    so model_state accumulates roughly two thousand points per day, each
-    holding a complete serialised model across its chunk fields. Asking
-    for the last point in a 35-day range therefore made InfluxDB scan
-    weeks of accumulated blobs to find one written five minutes ago,
-    which is what produced the 500s seen in deployment. In normal
-    operation the first window matches and the scan covers a couple of
-    dozen points instead of tens of thousands.
+    The read is done one field at a time. Requesting every field in a
+    single query returns the whole serialised model in one response and
+    made InfluxDB return 500s across every time window once the models
+    had grown. Fetching chunk_count first and then each chunk
+    individually keeps each response small, at the cost of one query per
+    chunk. At a five-minute reading interval that cost is irrelevant.
+
+    Windows are searched narrowest-first because save_model_blob writes
+    a NEW point on every save, so model_state accumulates thousands of
+    superseded blobs behind the current one.
     """
     gen = _get_current_generation(home_id)
     last_error = None
     read_failed = False
 
     for window in _MODEL_READ_WINDOWS:
-        fields = None
-        for attempt in range(_MODEL_READ_ATTEMPTS):
-            try:
-                fields = _fetch_model_state(home_id, model_name, gen, window)
-                break
-            except Exception as e:
-                last_error = e
-                read_failed = True
-                print(
-                    f"[InfluxDB] load_model_blob({model_name}) read failed over "
-                    f"{window} (attempt {attempt + 1}/{_MODEL_READ_ATTEMPTS}): {e}"
-                )
-                if attempt + 1 < _MODEL_READ_ATTEMPTS:
-                    time.sleep(_MODEL_READ_RETRY_SECONDS * (attempt + 1))
+        try:
+            count_value, saved_at = _fetch_model_field(
+                home_id, model_name, gen, window, "chunk_count"
+            )
+        except Exception as e:
+            last_error = e
+            read_failed = True
+            print(
+                f"[InfluxDB] load_model_blob({model_name}) chunk_count read "
+                f"failed over {window}: {e}"
+            )
+            continue
 
-        if fields is None:
-            continue  # every attempt over this window errored; try the next
-        if "chunk_count" not in fields:
+        if count_value is None:
             continue  # nothing stored in this window; widen the search
 
-        chunk_count = int(fields["chunk_count"])
+        chunk_count = int(count_value)
         parts = []
         for i in range(chunk_count):
             key = f"chunk_{i}"
-            if key not in fields:
+            chunk = None
+            for attempt in range(_MODEL_READ_ATTEMPTS):
+                try:
+                    chunk = _fetch_model_field_at(
+                        home_id, model_name, gen, key, saved_at
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+                    read_failed = True
+                    print(
+                        f"[InfluxDB] load_model_blob({model_name}) {key} read "
+                        f"failed (attempt {attempt + 1}/{_MODEL_READ_ATTEMPTS}): {e}"
+                    )
+                    if attempt + 1 < _MODEL_READ_ATTEMPTS:
+                        time.sleep(_MODEL_READ_RETRY_SECONDS * (attempt + 1))
+            else:
+                # every attempt on this chunk errored -- the blob is
+                # intact in the database, we simply could not read it
+                raise ModelStoreUnavailable(
+                    f"could not read {key} of model '{model_name}' for "
+                    f"'{home_id}': {last_error}"
+                )
+
+            if chunk is None:
                 print(
                     f"[InfluxDB] load_model_blob({model_name}) missing {key} -- partial save, discarding"
                 )
                 return None
-            parts.append(fields[key])
+            parts.append(chunk)
+
         return "".join(parts)
 
     # Every window came back clean but empty: no model has been saved.
@@ -647,9 +707,8 @@ def load_model_blob(home_id: str, model_name: str) -> str | None:
         return None
 
     raise ModelStoreUnavailable(
-        f"could not read model '{model_name}' for '{home_id}' after "
-        f"{_MODEL_READ_ATTEMPTS} attempts over {len(_MODEL_READ_WINDOWS)} "
-        f"time windows: {last_error}"
+        f"could not read model '{model_name}' for '{home_id}' over "
+        f"{len(_MODEL_READ_WINDOWS)} time windows: {last_error}"
     )
 
 
